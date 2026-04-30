@@ -133,8 +133,8 @@ jobs:
 
       - name: Verify protected endpoints
         run: |
-          BOLETOS_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/boletos?paid=all")
-          AUTH_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/auth/" -H "Content-Type: application/json" -d '{}')
+          BOLETOS_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/boletos.php?paid=all")
+          AUTH_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/auth.php" -H "Content-Type: application/json" -d '{}')
           echo "boletos=${BOLETOS_STATUS} auth=${AUTH_STATUS}"
           test "${BOLETOS_STATUS}" = "401"
           test "${AUTH_STATUS}" = "422"
