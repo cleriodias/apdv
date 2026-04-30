@@ -108,10 +108,19 @@ function table_columns(string $tableName): array
     );
     $statement->execute(['table_name' => $tableName]);
 
-    $cache[$tableName] = array_map(
-        static fn (array $row): string => (string) ($row['column_name'] ?? ''),
+    $cache[$tableName] = array_values(array_filter(array_map(
+        static function (array $row): string {
+            foreach ($row as $value) {
+                $column = trim((string) $value);
+                if ($column !== '') {
+                    return $column;
+                }
+            }
+
+            return '';
+        },
         $statement->fetchAll()
-    );
+    )));
 
     return $cache[$tableName];
 }
@@ -489,10 +498,9 @@ function expand_unit_ids_with_matrix_units(array $unitIds, ?int $matrixId = null
             $matrixIds = fetch_matrix_ids_from_units($unitIds, $matrixColumn);
         }
 
-        $matrixIds = normalize_positive_int_ids([
-            ...$matrixIds,
-            ...fetch_matrix_unit_ids_from_units($unitIds),
-        ]);
+        if ($matrixIds === []) {
+            $matrixIds = fetch_matrix_unit_ids_from_units($unitIds);
+        }
 
         if ($matrixIds !== []) {
             return normalize_positive_int_ids([
