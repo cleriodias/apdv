@@ -10,7 +10,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      AZURE_WEBAPP_NAME: app-pdv
+      AZURE_WEBAPP_NAME: apec-rodrigo
 
     steps:
       - name: Checkout
