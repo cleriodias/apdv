@@ -79,8 +79,25 @@ jobs:
           if not publish_url or not username or not password:
               raise SystemExit("Publish profile incompleto para Zip Deploy.")
 
-          scm_host = publish_url.split(":")[0]
-          public_host = scm_host[4:] if scm_host.startswith("scm.") else scm_host
+          app_name = os.environ.get("AZURE_WEBAPP_NAME", "").strip()
+          if not app_name:
+              raise SystemExit("AZURE_WEBAPP_NAME nao configurado.")
+
+          scm_host = publish_url.split(":", 1)[0].strip()
+          expected_scm_host = f"{app_name}.scm.azurewebsites.net"
+          expected_public_host = f"{app_name}.azurewebsites.net"
+          if scm_host.lower() != expected_scm_host.lower():
+              raise SystemExit(
+                  f"Publish profile aponta para {scm_host}, mas AZURE_WEBAPP_NAME e {app_name}. "
+                  f"Atualize o secret AZURE_WEBAPP_PUBLISH_PROFILE com o PublishSettings do App Service {app_name}."
+              )
+
+          public_host = scm_host.replace(".scm.", ".", 1)
+          if public_host.lower() != expected_public_host.lower():
+              raise SystemExit(
+                  f"Host publico calculado como {public_host}, esperado {expected_public_host}."
+              )
+
           print(f"scm_host={scm_host}")
           print(f"public_host={public_host}")
           print(f"username={username}")
