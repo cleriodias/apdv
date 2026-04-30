@@ -80,7 +80,9 @@ jobs:
               raise SystemExit("Publish profile incompleto para Zip Deploy.")
 
           scm_host = publish_url.split(":")[0]
+          public_host = scm_host[4:] if scm_host.startswith("scm.") else scm_host
           print(f"scm_host={scm_host}")
+          print(f"public_host={public_host}")
           print(f"username={username}")
           print(f"password={password}")
           PY
@@ -131,18 +133,51 @@ jobs:
             upload_file "$file" "$relative_path"
           done < <(find deploy -type f -print0)
 
-      - name: Verify protected endpoints
+      - name: Verify uploaded endpoint files
+        env:
+          SCM_HOST: ${{ steps.publish_profile.outputs.scm_host }}
+          PUBLISH_USERNAME: ${{ steps.publish_profile.outputs.username }}
+          PUBLISH_PASSWORD: ${{ steps.publish_profile.outputs.password }}
         run: |
-          BOLETOS_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/boletos.php?paid=all")
-          AUTH_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/auth.php" -H "Content-Type: application/json" -d '{}')
+          set -e
+
+          verify_file() {
+            local target_path="$1"
+            local http_code
+
+            http_code=$(curl -sS \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --connect-timeout 20 \
+              -u "$PUBLISH_USERNAME:$PUBLISH_PASSWORD" \
+              -o /dev/null \
+              -w "%{http_code}" \
+              "https://${SCM_HOST}/api/vfs/site/wwwroot/${target_path}")
+
+            echo "Verify ${target_path}: HTTP ${http_code}"
+            test "$http_code" = "200"
+          }
+
+          verify_file "endpoints/mobile/boletos.php"
+          verify_file "endpoints/mobile/auth.php"
+
+      - name: Verify protected endpoints
+        env:
+          PUBLIC_HOST: ${{ steps.publish_profile.outputs.public_host }}
+        run: |
+          BOLETOS_STATUS=$(curl -sS --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o /dev/null -w "%{http_code}" "https://${PUBLIC_HOST}/endpoints/mobile/boletos.php?paid=all")
+          AUTH_STATUS=$(curl -sS --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o /dev/null -w "%{http_code}" -X POST "https://${PUBLIC_HOST}/endpoints/mobile/auth.php" -H "Content-Type: application/json" -d '{}')
           echo "boletos=${BOLETOS_STATUS} auth=${AUTH_STATUS}"
           test "${BOLETOS_STATUS}" = "401"
           test "${AUTH_STATUS}" = "422"
 
       - name: Verify protected chat root endpoints
+        env:
+          PUBLIC_HOST: ${{ steps.publish_profile.outputs.public_host }}
         run: |
-          CHAT_SNAPSHOT_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/cliente-chat-buscar.php")
-          CHAT_SEND_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/cliente-chat-enviar.php" -H "Content-Type: application/json" -d '{}')
+          CHAT_SNAPSHOT_STATUS=$(curl -sS --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o /dev/null -w "%{http_code}" "https://${PUBLIC_HOST}/endpoints/cliente-chat-buscar.php")
+          CHAT_SEND_STATUS=$(curl -sS --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 -o /dev/null -w "%{http_code}" -X POST "https://${PUBLIC_HOST}/endpoints/cliente-chat-enviar.php" -H "Content-Type: application/json" -d '{}')
           echo "chat_snapshot=${CHAT_SNAPSHOT_STATUS} chat_send=${CHAT_SEND_STATUS}"
           test "${CHAT_SNAPSHOT_STATUS}" = "401"
           test "${CHAT_SEND_STATUS}" = "401"
