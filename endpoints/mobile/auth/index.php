@@ -20,16 +20,11 @@ try {
     $conditions = user_activity_conditions('u');
     $conditions[] = 'lower(u.email) = :email';
     $whereSql = ' where ' . implode(' and ', $conditions);
+    $userSelect = auth_user_select_sql('u');
 
     $statement = db()->prepare(
         "select
-            u.id,
-            u.name,
-            u.email,
-            u.password,
-            u.funcao,
-            u.funcao_original,
-            u.tb2_id
+            {$userSelect}
          from users u
          {$whereSql}
          limit 1"
@@ -48,7 +43,8 @@ try {
 
     $allowedUnitIds = fetch_allowed_unit_ids_for_user(
         (int) ($user['id'] ?? 0),
-        isset($user['tb2_id']) ? (int) $user['tb2_id'] : null
+        isset($user['tb2_id']) ? (int) $user['tb2_id'] : null,
+        auth_matrix_id_from_row($user)
     );
 
     if ($allowedUnitIds === []) {

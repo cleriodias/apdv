@@ -150,6 +150,32 @@ function auth_role_from_row(array $row): int
     return (int) ($row['funcao_original'] ?? $row['funcao'] ?? -1);
 }
 
+function auth_matrix_id_from_row(array $row): ?int
+{
+    $matrixId = (int) ($row['matriz_id'] ?? 0);
+
+    return $matrixId > 0 ? $matrixId : null;
+}
+
+function auth_user_select_sql(string $alias = 'u'): string
+{
+    $fields = [
+        "{$alias}.id",
+        "{$alias}.name",
+        "{$alias}.email",
+        "{$alias}.password",
+        "{$alias}.funcao",
+        "{$alias}.funcao_original",
+        "{$alias}.tb2_id",
+    ];
+
+    if (in_array('matriz_id', table_columns('users'), true)) {
+        $fields[] = "{$alias}.matriz_id";
+    }
+
+    return implode(",\n            ", $fields);
+}
+
 function request_bearer_token(): string
 {
     $header = (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['Authorization'] ?? '');
@@ -251,7 +277,190 @@ function unit_is_allowed(int $unitId, array $allowedUnitIds): bool
     return $unitId > 0 && in_array($unitId, $allowedUnitIds, true);
 }
 
-function fetch_allowed_unit_ids_for_user(int $userId, ?int $primaryUnitId = null): array
+function normalize_positive_int_ids(array $ids): array
+{
+    $normalized = array_values(array_unique(array_filter(
+        array_map('intval', $ids),
+        static fn (int $id): bool => $id > 0
+    )));
+    sort($normalized);
+
+    return $normalized;
+}
+
+function first_existing_column(array $availableColumns, array $candidates): ?string
+{
+    foreach ($candidates as $candidate) {
+        if (in_array($candidate, $availableColumns, true)) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+function unit_matrix_id_column(): ?string
+{
+    $columns = table_columns('tb2_unidades');
+
+    return first_existing_column($columns, [
+        'matriz_id',
+        'matrix_id',
+        'tb2_matriz_id',
+        'tb2_id_matriz',
+        'id_matriz',
+    ]);
+}
+
+function unit_parent_relation_column(): ?string
+{
+    $columns = table_columns('tb2_unidades');
+
+    return first_existing_column($columns, [
+        'unidade_matriz_id',
+        'id_unidade_matriz',
+        'loja_matriz_id',
+        'tb2_unidade_matriz_id',
+        'tb2_pai_id',
+        'tb2_id_pai',
+        'id_pai',
+        'pai_id',
+        'parent_id',
+        'tb2_parent_id',
+        'unidade_pai_id',
+        'id_unidade_pai',
+    ]);
+}
+
+function fetch_matrix_ids_from_units(array $unitIds, string $matrixColumn): array
+{
+    $unitIds = normalize_positive_int_ids($unitIds);
+    if ($unitIds === []) {
+        return [];
+    }
+
+    [$placeholders, $params] = build_sql_placeholders($unitIds, 'matrix_seed_unit');
+    $statement = db()->prepare(
+        "select distinct {$matrixColumn} as matrix_id
+         from tb2_unidades
+         where tb2_id in (" . implode(', ', $placeholders) . ")
+           and {$matrixColumn} is not null"
+    );
+    $statement->execute($params);
+
+    return normalize_positive_int_ids(array_map(
+        static fn (array $row): int => (int) ($row['matrix_id'] ?? 0),
+        $statement->fetchAll()
+    ));
+}
+
+function fetch_unit_ids_from_matrix_ids(array $matrixIds, string $matrixColumn): array
+{
+    $matrixIds = normalize_positive_int_ids($matrixIds);
+    if ($matrixIds === []) {
+        return [];
+    }
+
+    [$placeholders, $params] = build_sql_placeholders($matrixIds, 'allowed_matrix');
+    $statement = db()->prepare(
+        "select tb2_id
+         from tb2_unidades
+         where {$matrixColumn} in (" . implode(', ', $placeholders) . ')'
+    );
+    $statement->execute($params);
+
+    return normalize_positive_int_ids(array_map(
+        static fn (array $row): int => (int) ($row['tb2_id'] ?? 0),
+        $statement->fetchAll()
+    ));
+}
+
+function expand_unit_ids_with_parent_units(array $unitIds): array
+{
+    $unitIds = normalize_positive_int_ids($unitIds);
+
+    if ($unitIds === [] || !table_exists('tb2_unidades')) {
+        return $unitIds;
+    }
+
+    $relationColumn = unit_parent_relation_column();
+    if ($relationColumn === null) {
+        return $unitIds;
+    }
+
+    [$seedPlaceholders, $seedParams] = build_sql_placeholders($unitIds, 'seed_unit');
+    $seedStatement = db()->prepare(
+        "select tb2_id, {$relationColumn} as matrix_unit_id
+         from tb2_unidades
+         where tb2_id in (" . implode(', ', $seedPlaceholders) . ')'
+    );
+    $seedStatement->execute($seedParams);
+
+    $matrixUnitIds = [];
+    foreach ($seedStatement->fetchAll() as $row) {
+        $unitId = (int) ($row['tb2_id'] ?? 0);
+        $matrixUnitId = (int) ($row['matrix_unit_id'] ?? 0);
+
+        $matrixUnitIds[] = $matrixUnitId > 0 ? $matrixUnitId : $unitId;
+    }
+
+    $matrixUnitIds = normalize_positive_int_ids($matrixUnitIds);
+    if ($matrixUnitIds === []) {
+        return $unitIds;
+    }
+
+    [$matrixIdPlaceholders, $matrixIdParams] = build_sql_placeholders($matrixUnitIds, 'matrix_unit_id');
+    [$matrixLinkPlaceholders, $matrixLinkParams] = build_sql_placeholders($matrixUnitIds, 'matrix_unit_link');
+    $familyStatement = db()->prepare(
+        "select tb2_id
+         from tb2_unidades
+         where tb2_id in (" . implode(', ', $matrixIdPlaceholders) . ")
+            or {$relationColumn} in (" . implode(', ', $matrixLinkPlaceholders) . ')'
+    );
+    $familyStatement->execute([
+        ...$matrixIdParams,
+        ...$matrixLinkParams,
+    ]);
+
+    foreach ($familyStatement->fetchAll() as $row) {
+        $unitIds[] = (int) ($row['tb2_id'] ?? 0);
+    }
+
+    return normalize_positive_int_ids($unitIds);
+}
+
+function expand_unit_ids_with_matrix_units(array $unitIds, ?int $matrixId = null): array
+{
+    $unitIds = normalize_positive_int_ids($unitIds);
+
+    if (!table_exists('tb2_unidades')) {
+        return $unitIds;
+    }
+
+    if ($unitIds === [] && (int) ($matrixId ?? 0) <= 0) {
+        return $unitIds;
+    }
+
+    $matrixColumn = unit_matrix_id_column();
+    if ($matrixColumn !== null) {
+        $matrixIds = normalize_positive_int_ids([$matrixId ?? 0]);
+
+        if ($matrixIds === []) {
+            $matrixIds = fetch_matrix_ids_from_units($unitIds, $matrixColumn);
+        }
+
+        if ($matrixIds !== []) {
+            return normalize_positive_int_ids([
+                ...$unitIds,
+                ...fetch_unit_ids_from_matrix_ids($matrixIds, $matrixColumn),
+            ]);
+        }
+    }
+
+    return expand_unit_ids_with_parent_units($unitIds);
+}
+
+function fetch_allowed_unit_ids_for_user(int $userId, ?int $primaryUnitId = null, ?int $matrixId = null): array
 {
     $unitIds = [];
 
@@ -275,10 +484,7 @@ function fetch_allowed_unit_ids_for_user(int $userId, ?int $primaryUnitId = null
         }
     }
 
-    $unitIds = array_values(array_unique(array_filter($unitIds, static fn (int $id): bool => $id > 0)));
-    sort($unitIds);
-
-    return $unitIds;
+    return expand_unit_ids_with_matrix_units($unitIds, $matrixId);
 }
 
 function fetch_allowed_units_metadata(array $unitIds): array
@@ -357,16 +563,11 @@ function find_auth_user(int $userId): ?array
     $conditions = user_activity_conditions('u');
     $conditions[] = 'u.id = :user_id';
     $whereSql = ' where ' . implode(' and ', $conditions);
+    $userSelect = auth_user_select_sql('u');
 
     $statement = db()->prepare(
         "select
-            u.id,
-            u.name,
-            u.email,
-            u.password,
-            u.funcao,
-            u.funcao_original,
-            u.tb2_id
+            {$userSelect}
          from users u
          {$whereSql}
          limit 1"
@@ -402,12 +603,10 @@ function require_master_session(): array
 
     $dbAllowedUnitIds = fetch_allowed_unit_ids_for_user(
         (int) ($user['id'] ?? 0),
-        isset($user['tb2_id']) ? (int) $user['tb2_id'] : null
+        isset($user['tb2_id']) ? (int) $user['tb2_id'] : null,
+        auth_matrix_id_from_row($user)
     );
-    $tokenAllowedUnitIds = array_values(array_unique(array_map('intval', (array) ($payload['allowed_unit_ids'] ?? []))));
-    $allowedUnitIds = $tokenAllowedUnitIds !== []
-        ? array_values(array_intersect($dbAllowedUnitIds, $tokenAllowedUnitIds))
-        : $dbAllowedUnitIds;
+    $allowedUnitIds = $dbAllowedUnitIds;
 
     if ($allowedUnitIds === []) {
         json_response(['ok' => false, 'error' => 'Nenhuma loja vinculada a este MASTER foi encontrada.'], 403);
