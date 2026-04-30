@@ -312,6 +312,19 @@ function unit_matrix_id_column(): ?string
     ]);
 }
 
+function unit_type_column(): ?string
+{
+    $columns = table_columns('tb2_unidades');
+
+    return first_existing_column($columns, [
+        'tb2_tipo',
+        'tipo',
+        'tipo_unidade',
+        'unidade_tipo',
+        'unit_type',
+    ]);
+}
+
 function unit_parent_relation_column(): ?string
 {
     $columns = table_columns('tb2_unidades');
@@ -350,6 +363,33 @@ function fetch_matrix_ids_from_units(array $unitIds, string $matrixColumn): arra
 
     return normalize_positive_int_ids(array_map(
         static fn (array $row): int => (int) ($row['matrix_id'] ?? 0),
+        $statement->fetchAll()
+    ));
+}
+
+function fetch_matrix_unit_ids_from_units(array $unitIds): array
+{
+    $unitIds = normalize_positive_int_ids($unitIds);
+    if ($unitIds === []) {
+        return [];
+    }
+
+    $typeColumn = unit_type_column();
+    if ($typeColumn === null) {
+        return [];
+    }
+
+    [$placeholders, $params] = build_sql_placeholders($unitIds, 'typed_seed_unit');
+    $statement = db()->prepare(
+        "select tb2_id
+         from tb2_unidades
+         where tb2_id in (" . implode(', ', $placeholders) . ")
+           and lower(trim(coalesce({$typeColumn}, ''))) = 'matriz'"
+    );
+    $statement->execute($params);
+
+    return normalize_positive_int_ids(array_map(
+        static fn (array $row): int => (int) ($row['tb2_id'] ?? 0),
         $statement->fetchAll()
     ));
 }
@@ -448,6 +488,11 @@ function expand_unit_ids_with_matrix_units(array $unitIds, ?int $matrixId = null
         if ($matrixIds === []) {
             $matrixIds = fetch_matrix_ids_from_units($unitIds, $matrixColumn);
         }
+
+        $matrixIds = normalize_positive_int_ids([
+            ...$matrixIds,
+            ...fetch_matrix_unit_ids_from_units($unitIds),
+        ]);
 
         if ($matrixIds !== []) {
             return normalize_positive_int_ids([
