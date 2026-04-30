@@ -1,0 +1,148 @@
+name: Deploy endpoints to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_WEBAPP_NAME: apdv
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo_mysql
+
+      - name: Validate endpoints
+        run: |
+          if [ ! -d "endpoints" ] || [ -z "$(find endpoints -type f)" ]; then
+            echo "A pasta endpoints esta vazia. Adicione os arquivos PHP antes do deploy."
+            exit 1
+          fi
+          for file in endpoints/cliente-chat-buscar.php endpoints/cliente-chat-enviar.php; do
+            if [ ! -f "$file" ]; then
+              echo "Arquivo obrigatorio ausente: $file"
+              exit 1
+            fi
+          done
+          find endpoints -name "*.php" -print0 | xargs -0 -n1 php -l
+
+      - name: Prepare package
+        run: |
+          rm -rf deploy
+          mkdir -p deploy
+          cp -R endpoints deploy/endpoints
+          cp web.config deploy/web.config
+          test -f deploy/endpoints/cliente-chat-buscar.php
+          test -f deploy/endpoints/cliente-chat-enviar.php
+          (cd deploy && zip -r ../azure-package.zip .)
+
+      - name: Verify package contents
+        run: |
+          unzip -l azure-package.zip | grep "endpoints/cliente-chat-buscar.php"
+          unzip -l azure-package.zip | grep "endpoints/cliente-chat-enviar.php"
+
+      - name: Extract Zip Deploy credentials
+        id: publish_profile
+        env:
+          PUBLISH_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import xml.etree.ElementTree as ET
+
+          raw = os.environ.get("PUBLISH_PROFILE", "").strip()
+          if not raw:
+              raise SystemExit("Secret AZURE_WEBAPP_PUBLISH_PROFILE nao configurado.")
+
+          root = ET.fromstring(raw)
+          profiles = root.findall("publishProfile")
+          profile = next(
+              (item for item in profiles if item.attrib.get("publishMethod", "").lower() == "zipdeploy"),
+              profiles[0] if profiles else None,
+          )
+          if profile is None:
+              raise SystemExit("Publish profile nao possui publishProfile.")
+
+          publish_url = profile.attrib.get("publishUrl", "")
+          username = profile.attrib.get("userName", "")
+          password = profile.attrib.get("userPWD", "")
+          if not publish_url or not username or not password:
+              raise SystemExit("Publish profile incompleto para Zip Deploy.")
+
+          scm_host = publish_url.split(":")[0]
+          print(f"scm_host={scm_host}")
+          print(f"username={username}")
+          print(f"password={password}")
+          PY
+
+      - name: Mask publish credentials
+        run: |
+          echo "::add-mask::${{ steps.publish_profile.outputs.username }}"
+          echo "::add-mask::${{ steps.publish_profile.outputs.password }}"
+
+      - name: Deploy files with Kudu VFS
+        env:
+          SCM_HOST: ${{ steps.publish_profile.outputs.scm_host }}
+          PUBLISH_USERNAME: ${{ steps.publish_profile.outputs.username }}
+          PUBLISH_PASSWORD: ${{ steps.publish_profile.outputs.password }}
+        run: |
+          set -e
+
+          upload_file() {
+            local source_path="$1"
+            local target_path="$2"
+            local http_code
+
+            http_code=$(curl -sS \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --connect-timeout 20 \
+              -u "$PUBLISH_USERNAME:$PUBLISH_PASSWORD" \
+              -X PUT \
+              --data-binary @"$source_path" \
+              -H "If-Match: *" \
+              -o upload-response.txt \
+              -w "%{http_code}" \
+              "https://${SCM_HOST}/api/vfs/site/wwwroot/${target_path}")
+
+            echo "Upload ${target_path}: HTTP ${http_code}"
+            if [ -s upload-response.txt ]; then
+              cat upload-response.txt
+            fi
+
+            if [ "$http_code" != "200" ] && [ "$http_code" != "201" ] && [ "$http_code" != "204" ]; then
+              exit 1
+            fi
+          }
+
+          while IFS= read -r -d '' file; do
+            relative_path="${file#deploy/}"
+            upload_file "$file" "$relative_path"
+          done < <(find deploy -type f -print0)
+
+      - name: Verify protected endpoints
+        run: |
+          BOLETOS_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/boletos?paid=all")
+          AUTH_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/mobile/auth/" -H "Content-Type: application/json" -d '{}')
+          echo "boletos=${BOLETOS_STATUS} auth=${AUTH_STATUS}"
+          test "${BOLETOS_STATUS}" = "401"
+          test "${AUTH_STATUS}" = "422"
+
+      - name: Verify protected chat root endpoints
+        run: |
+          CHAT_SNAPSHOT_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/cliente-chat-buscar.php")
+          CHAT_SEND_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "https://${AZURE_WEBAPP_NAME}.azurewebsites.net/endpoints/cliente-chat-enviar.php" -H "Content-Type: application/json" -d '{}')
+          echo "chat_snapshot=${CHAT_SNAPSHOT_STATUS} chat_send=${CHAT_SEND_STATUS}"
+          test "${CHAT_SNAPSHOT_STATUS}" = "401"
+          test "${CHAT_SEND_STATUS}" = "401"

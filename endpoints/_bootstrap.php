@@ -1,0 +1,434 @@
+<?php
+
+declare(strict_types=1);
+
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Headers: Authorization, Content-Type, Accept');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+if ($requestMethod === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+const MASTER_ROLE = 0;
+const ROLE_LABELS = [
+    0 => 'MASTER',
+    1 => 'GERENTE',
+    2 => 'SUB-GERENTE',
+    3 => 'CAIXA',
+    4 => 'LANCHONETE',
+    5 => 'FUNCIONARIO',
+    6 => 'CLIENTE',
+];
+
+function json_response(array $payload, int $status = 200): void
+{
+    http_response_code($status);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function db(): PDO
+{
+    static $pdo = null;
+
+    if ($pdo instanceof PDO) {
+        return $pdo;
+    }
+
+    $host = getenv('DB_HOST') ?: '';
+    $database = getenv('DB_DATABASE') ?: '';
+    $username = getenv('DB_USERNAME') ?: '';
+    $password = getenv('DB_PASSWORD') ?: '';
+    $sslCa = getenv('MYSQL_ATTR_SSL_CA') ?: null;
+
+    if ($host === '' || $database === '' || $username === '' || $password === '') {
+        json_response(['ok' => false, 'error' => 'Configuracao do banco incompleta.'], 500);
+    }
+
+    $options = [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ];
+
+    if ($sslCa) {
+        $options[PDO::MYSQL_ATTR_SSL_CA] = $sslCa;
+    }
+
+    $pdo = new PDO(
+        "mysql:host={$host};port=3306;dbname={$database};charset=utf8mb4",
+        $username,
+        $password,
+        $options
+    );
+
+    return $pdo;
+}
+
+function input_json(): array
+{
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+
+    if (is_array($data)) {
+        return $data;
+    }
+
+    if (!empty($_POST) && is_array($_POST)) {
+        return $_POST;
+    }
+
+    $contentType = strtolower((string) ($_SERVER['CONTENT_TYPE'] ?? ''));
+    if (str_contains($contentType, 'application/x-www-form-urlencoded')) {
+        parse_str($raw, $formData);
+        return is_array($formData) ? $formData : [];
+    }
+
+    return [];
+}
+
+function table_columns(string $tableName): array
+{
+    static $cache = [];
+
+    if (array_key_exists($tableName, $cache)) {
+        return $cache[$tableName];
+    }
+
+    $statement = db()->prepare(
+        'select column_name
+         from information_schema.columns
+         where table_schema = database()
+           and table_name = :table_name'
+    );
+    $statement->execute(['table_name' => $tableName]);
+
+    $cache[$tableName] = array_map(
+        static fn (array $row): string => (string) ($row['column_name'] ?? ''),
+        $statement->fetchAll()
+    );
+
+    return $cache[$tableName];
+}
+
+function table_exists(string $tableName): bool
+{
+    return table_columns($tableName) !== [];
+}
+
+function user_activity_conditions(string $alias = 'u'): array
+{
+    $columns = table_columns('users');
+    $conditions = [];
+
+    if (in_array('deleted_at', $columns, true)) {
+        $conditions[] = "{$alias}.deleted_at is null";
+    }
+
+    foreach (['status', 'ativo', 'is_active', 'active', 'tb3_status'] as $column) {
+        if (in_array($column, $columns, true)) {
+            $conditions[] = "coalesce({$alias}.{$column}, 1) = 1";
+            break;
+        }
+    }
+
+    return $conditions;
+}
+
+function auth_role_label(int $role): string
+{
+    return ROLE_LABELS[$role] ?? '---';
+}
+
+function auth_role_from_row(array $row): int
+{
+    return (int) ($row['funcao_original'] ?? $row['funcao'] ?? -1);
+}
+
+function request_bearer_token(): string
+{
+    $header = (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['Authorization'] ?? '');
+
+    if (preg_match('/Bearer\s+(.+)$/i', $header, $matches) === 1) {
+        return trim((string) ($matches[1] ?? ''));
+    }
+
+    return '';
+}
+
+function base64url_encode(string $value): string
+{
+    return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
+}
+
+function base64url_decode(string $value): string|false
+{
+    $padding = strlen($value) % 4;
+
+    if ($padding !== 0) {
+        $value .= str_repeat('=', 4 - $padding);
+    }
+
+    return base64_decode(strtr($value, '-_', '+/'), true);
+}
+
+function app_secret(): string
+{
+    static $secret = null;
+
+    if (is_string($secret)) {
+        return $secret;
+    }
+
+    $candidates = [
+        (string) (getenv('AUTH_SESSION_SECRET') ?: ''),
+        (string) (getenv('APP_KEY') ?: ''),
+    ];
+
+    foreach ($candidates as $candidate) {
+        if ($candidate === '') {
+            continue;
+        }
+
+        if (str_starts_with($candidate, 'base64:')) {
+            $decoded = base64_decode(substr($candidate, 7), true);
+            if ($decoded !== false && $decoded !== '') {
+                $secret = $decoded;
+                return $secret;
+            }
+        }
+
+        $secret = $candidate;
+        return $secret;
+    }
+
+    $secret = hash(
+        'sha256',
+        implode('|', [
+            (string) (getenv('DB_HOST') ?: ''),
+            (string) (getenv('DB_DATABASE') ?: ''),
+            (string) (getenv('DB_USERNAME') ?: ''),
+            __DIR__,
+        ]),
+        true
+    );
+
+    return $secret;
+}
+
+function build_sql_placeholders(array $ids, string $prefix = 'id'): array
+{
+    $params = [];
+    $placeholders = [];
+
+    foreach (array_values($ids) as $index => $id) {
+        $key = "{$prefix}_{$index}";
+        $params[$key] = (int) $id;
+        $placeholders[] = ':' . $key;
+    }
+
+    return [$placeholders, $params];
+}
+
+function build_unit_scope_condition(array $allowedUnitIds, string $column, string $prefix = 'unit'): array
+{
+    if ($allowedUnitIds === []) {
+        return ['1 = 0', []];
+    }
+
+    [$placeholders, $params] = build_sql_placeholders($allowedUnitIds, $prefix);
+
+    return [$column . ' in (' . implode(', ', $placeholders) . ')', $params];
+}
+
+function unit_is_allowed(int $unitId, array $allowedUnitIds): bool
+{
+    return $unitId > 0 && in_array($unitId, $allowedUnitIds, true);
+}
+
+function fetch_allowed_unit_ids_for_user(int $userId, ?int $primaryUnitId = null): array
+{
+    $unitIds = [];
+
+    if ($primaryUnitId !== null && $primaryUnitId > 0) {
+        $unitIds[] = $primaryUnitId;
+    }
+
+    if (table_exists('tb2_unidade_user')) {
+        $statement = db()->prepare(
+            'select tb2_id
+             from tb2_unidade_user
+             where user_id = :user_id'
+        );
+        $statement->execute(['user_id' => $userId]);
+
+        foreach ($statement->fetchAll() as $row) {
+            $unitId = (int) ($row['tb2_id'] ?? 0);
+            if ($unitId > 0) {
+                $unitIds[] = $unitId;
+            }
+        }
+    }
+
+    $unitIds = array_values(array_unique(array_filter($unitIds, static fn (int $id): bool => $id > 0)));
+    sort($unitIds);
+
+    return $unitIds;
+}
+
+function fetch_allowed_units_metadata(array $unitIds): array
+{
+    if ($unitIds === []) {
+        return [];
+    }
+
+    [$placeholders, $params] = build_sql_placeholders($unitIds, 'meta_unit');
+    $statement = db()->prepare(
+        'select tb2_id as id, tb2_nome as name
+         from tb2_unidades
+         where tb2_id in (' . implode(', ', $placeholders) . ')
+         order by tb2_nome asc'
+    );
+    $statement->execute($params);
+
+    return array_map(static fn (array $row): array => [
+        'id' => (int) ($row['id'] ?? 0),
+        'name' => (string) ($row['name'] ?? ''),
+    ], $statement->fetchAll());
+}
+
+function issue_master_session_token(array $user, array $allowedUnitIds): string
+{
+    $payload = [
+        'user_id' => (int) ($user['id'] ?? 0),
+        'role' => auth_role_from_row($user),
+        'allowed_unit_ids' => array_values(array_map('intval', $allowedUnitIds)),
+        'exp' => time() + (60 * 60 * 24 * 7),
+    ];
+
+    $encodedPayload = base64url_encode((string) json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    $signature = hash_hmac('sha256', $encodedPayload, app_secret(), true);
+
+    return $encodedPayload . '.' . base64url_encode($signature);
+}
+
+function parse_master_session_token(string $token): ?array
+{
+    if ($token === '' || !str_contains($token, '.')) {
+        return null;
+    }
+
+    [$encodedPayload, $encodedSignature] = explode('.', $token, 2);
+    $expectedSignature = base64url_encode(hash_hmac('sha256', $encodedPayload, app_secret(), true));
+
+    if (!hash_equals($expectedSignature, $encodedSignature)) {
+        return null;
+    }
+
+    $decodedPayload = base64url_decode($encodedPayload);
+    if ($decodedPayload === false || $decodedPayload === '') {
+        return null;
+    }
+
+    $payload = json_decode($decodedPayload, true);
+    if (!is_array($payload)) {
+        return null;
+    }
+
+    $expiresAt = (int) ($payload['exp'] ?? 0);
+    if ($expiresAt <= time()) {
+        return null;
+    }
+
+    return $payload;
+}
+
+function find_auth_user(int $userId): ?array
+{
+    if ($userId <= 0) {
+        return null;
+    }
+
+    $conditions = user_activity_conditions('u');
+    $conditions[] = 'u.id = :user_id';
+    $whereSql = ' where ' . implode(' and ', $conditions);
+
+    $statement = db()->prepare(
+        "select
+            u.id,
+            u.name,
+            u.email,
+            u.password,
+            u.funcao,
+            u.funcao_original,
+            u.tb2_id
+         from users u
+         {$whereSql}
+         limit 1"
+    );
+    $statement->execute(['user_id' => $userId]);
+
+    $row = $statement->fetch();
+
+    return is_array($row) ? $row : null;
+}
+
+function require_master_session(): array
+{
+    $token = request_bearer_token();
+    if ($token === '') {
+        json_response(['ok' => false, 'error' => 'Sessao nao autenticada.'], 401);
+    }
+
+    $payload = parse_master_session_token($token);
+    if (!is_array($payload)) {
+        json_response(['ok' => false, 'error' => 'Sessao invalida ou expirada.'], 401);
+    }
+
+    $user = find_auth_user((int) ($payload['user_id'] ?? 0));
+    if (!$user) {
+        json_response(['ok' => false, 'error' => 'Usuario da sessao nao encontrado.'], 401);
+    }
+
+    $role = auth_role_from_row($user);
+    if ($role !== MASTER_ROLE) {
+        json_response(['ok' => false, 'error' => 'Apenas usuarios MASTER podem acessar este app.'], 403);
+    }
+
+    $dbAllowedUnitIds = fetch_allowed_unit_ids_for_user(
+        (int) ($user['id'] ?? 0),
+        isset($user['tb2_id']) ? (int) $user['tb2_id'] : null
+    );
+    $tokenAllowedUnitIds = array_values(array_unique(array_map('intval', (array) ($payload['allowed_unit_ids'] ?? []))));
+    $allowedUnitIds = $tokenAllowedUnitIds !== []
+        ? array_values(array_intersect($dbAllowedUnitIds, $tokenAllowedUnitIds))
+        : $dbAllowedUnitIds;
+
+    if ($allowedUnitIds === []) {
+        json_response(['ok' => false, 'error' => 'Nenhuma loja vinculada a este MASTER foi encontrada.'], 403);
+    }
+
+    return [
+        'id' => (int) ($user['id'] ?? 0),
+        'name' => (string) ($user['name'] ?? ''),
+        'email' => (string) ($user['email'] ?? ''),
+        'role' => $role,
+        'role_label' => auth_role_label($role),
+        'unit_id' => isset($user['tb2_id']) ? (int) $user['tb2_id'] : null,
+        'allowed_unit_ids' => $allowedUnitIds,
+        'allowed_units' => fetch_allowed_units_metadata($allowedUnitIds),
+    ];
+}
+
+function unsupported_orders_endpoint(): void
+{
+    json_response([
+        'ok' => false,
+        'error' => 'Endpoint de pedidos ainda nao configurado nesta base. As tabelas de pedidos nao foram encontradas no banco informado.',
+    ], 501);
+}
